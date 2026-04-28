@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const app = express();
 const port = process.env.PORT || 5000;
+const stripe = require("stripe")(`${process.env.STRIPE_SECRET_KEY}`);
 
 // middleware
 app.use(cors());
@@ -31,6 +32,7 @@ async function run() {
     const reviewCollection = client.db("bistro-boss-db").collection("reviews");
     const cartCollection = client.db("bistro-boss-db").collection("cart");
     const userCollection = client.db("bistro-boss-db").collection("user");
+    const paymentCollection = client.db("bistro-boss-db").collection("payment");
 
     // Json Web Token Related Api
     app.post("/jwt", async (req, res) => {
@@ -82,11 +84,38 @@ async function run() {
       res.send(result);
     });
 
-    // Delete Route For Menu Item - Only Admin Can Delete
+    // menu routes
+    // GET single menu item by id
+    app.get("/menu/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await menuCollection.findOne(query);
+      res.send(result);
+    });
+
+    // PUT — update menu item (admin only)
+    app.put("/menu/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const item = req.body;
+      const filter = { _id: new ObjectId(id) };
+      const updatedDoc = {
+        $set: {
+          name: item.name,
+          category: item.category,
+          price: item.price,
+          recipe: item.recipe,
+          image: item.image,
+        },
+      };
+      const result = await menuCollection.updateOne(filter, updatedDoc);
+      res.send(result);
+    });
+
+    // DELETE — delete menu item (admin only)
     app.delete("/menu/:id", verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
-      const filter = { _id: new ObjectId(id) };
-      const result = await menuCollection.deleteOne(filter);
+      const query = { _id: new ObjectId(id) };
+      const result = await menuCollection.deleteOne(query);
       res.send(result);
     });
 
@@ -122,17 +151,24 @@ async function run() {
       res.send({ admin });
     });
 
-    // Post Route For Cart Section
-    app.post("/carts", async (req, res) => {
+    // Post Route For Cart Section (authenticated user)
+    app.post("/carts", verifyToken, async (req, res) => {
       const cartItem = req.body;
       const result = await cartCollection.insertOne(cartItem);
       res.send(result);
     });
 
-    // Delete an item from the cart
-    app.delete("/carts/:id", async (req, res) => {
+    // Delete an item from the cart (authenticated user)
+    app.delete("/carts/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const filter = { _id: new ObjectId(id) };
+      const cartItem = await cartCollection.findOne(filter);
+      if (!cartItem) {
+        return res.status(404).send({ message: "Cart item not found" });
+      }
+      if (cartItem.email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
       const result = await cartCollection.deleteOne(filter);
       res.send(result);
     });
@@ -159,8 +195,8 @@ async function run() {
       res.send(result);
     });
 
-    // Update user role using PATCH method
-    app.patch("/users/:id", async (req, res) => {
+    // Update user role using PATCH method (admin only)
+    app.patch("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const filter = { _id: new ObjectId(id) };
       const updatedDoc = {
@@ -172,12 +208,104 @@ async function run() {
       res.send(result);
     });
 
-    // Delete Route For User
-    app.delete("/user/:id", async (req, res) => {
+    // Delete Route For User (admin only)
+    app.delete("/user/:id", verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const filter = { _id: new ObjectId(id) };
       const result = await userCollection.deleteOne(filter);
       res.send(result);
+    });
+
+    // Payment Intent
+    app.post("/create-payment-intent", async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+
+    // post route for payment
+    app.post("/payments", async (req, res) => {
+      try {
+        const payment = req.body;
+        const result = await paymentCollection.insertOne(payment);
+
+        // Query to clear cart
+        const query = {
+          _id: {
+            $in: payment.cartIds.map((id) => new ObjectId(id)),
+          },
+        };
+        const deleteResults = await cartCollection.deleteMany(query);
+
+        res.send({ result, deleteResults });
+      } catch (error) {
+        console.error("Payment Save Error:", error);
+        res.status(500).send({ error: "Something went wrong" });
+      }
+    });
+
+    // // get payment history by user email
+    app.get("/payment/:email", async (req, res) => {
+      const query = { email: req.params.email };
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    // stats and analysis for admin
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const user = await userCollection.estimatedDocumentCount();
+      const menu = await menuCollection.estimatedDocumentCount();
+      const orders = await cartCollection.estimatedDocumentCount();
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalReveneu: { $sum: "$price" },
+            },
+          },
+        ])
+        .toArray();
+      const reveneu = result.length > 0 ? result[0].totalReveneu : 0;
+
+      res.send({
+        user,
+        menu,
+        orders,
+        reveneu,
+      });
+    });
+
+    // stats and analysis for user
+    app.get("/user-stats", verifyToken, async (req, res) => {
+      try {
+        const email = req.query.email;
+        
+
+        const payments = await paymentCollection.countDocuments({ email });
+        const reviews = await reviewCollection.countDocuments({ email });
+        
+    
+        const bookings = await cartCollection.countDocuments({ email });
+
+        res.send({
+          orders: payments, 
+          reviews,
+          bookings,
+          payments: payments,
+        });
+      } catch (error) {
+        console.error("Error fetching user stats:", error);
+        res.status(500).send({ error: "Failed to load user stats" });
+      }
     });
 
     // Send a ping to confirm a successful connection
